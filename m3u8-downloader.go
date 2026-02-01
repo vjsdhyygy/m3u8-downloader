@@ -1,16 +1,18 @@
 // @author:llychao<lychao_vip@163.com> @edit:vjsdhyygy<vjsdhyygy@163.com>
 // @contributor: Junyi<me@junyi.pw>
 // @date:2026-02-11
-// @功能:golang m3u8 video Downloader
+// @功能: 多线程下载 + 广告切片暴力去重 + FFmpeg 外部合并
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/md5"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/url"
@@ -18,7 +20,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +28,8 @@ import (
 )
 
 const (
-	HEAD_TIMEOUT = 5 * time.Second
-	PROGRESS_WIDTH = 20
+	HEAD_TIMEOUT     = 5 * time.Second
+	PROGRESS_WIDTH   = 20
 	TS_NAME_TEMPLATE = "%05d.ts"
 )
 
@@ -44,8 +45,12 @@ var (
 
 	logger *log.Logger
 	ro     = &grequests.RequestOptions{
-		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36",
+		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36",
 		RequestTimeout: HEAD_TIMEOUT,
+		Headers: map[string]string{
+			"Connection": "keep-alive",
+			"Accept":     "*/*",
+		},
 	}
 )
 
@@ -63,7 +68,7 @@ func main() {
 }
 
 func Run() {
-	fmt.Println("[模式]: 暴力去广告模式 - 重复切片全数剔除 + FFmpeg 外部合并")
+	fmt.Println("[模式]: 暴力去广告 - 重复切片全删 + FFmpeg 外部合并")
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	now := time.Now()
 
@@ -73,8 +78,12 @@ func Run() {
 	hostType := *htFlag
 	movieName := *oFlag
 	autoClearFlag := *rFlag
+	cookie := *cFlag
+	insecure := *sFlag
 	savePath := *spFlag
 
+	if cookie != "" { ro.Headers["Cookie"] = cookie }
+	if insecure != 0 { ro.InsecureSkipVerify = true }
 	if !strings.HasPrefix(m3u8Url, "http") || m3u8Url == "" {
 		flag.Usage()
 		return
@@ -96,22 +105,27 @@ func Run() {
 	// 1. 下载
 	downloader(ts_list, maxGoroutines, download_dir, ts_key)
 
-	// 2. 暴力剔除重复项 (针对广告特征)
+	// 2. 暴力剔除重复项（针对广告切片 MD5 相同的特征）
 	purgeAllDuplicates(download_dir)
 
-	// 3. 调用外部 FFmpeg 合并
+	if ok := checkTsDownDir(download_dir); !ok {
+		fmt.Printf("\n[Failed] 目录为空或有效切片不足 \n")
+		return
+	}
+
+	// 3. 调用外部 FFmpeg 合并（解决广告删除后的 PTS 连续性问题）
 	mv := mergeWithFFmpeg(download_dir, movieName, pwd)
 
 	if autoClearFlag && mv != "" {
 		os.RemoveAll(download_dir)
 	}
 
-	fmt.Printf("\n[Success] 视频处理完成：%s | 耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
+	DrawProgressBar("Merging", float32(1), PROGRESS_WIDTH, mv)
+	fmt.Printf("\n[Success] 处理完成：%s | 耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
 }
 
-// 暴力剔除：只要重复，通通删光
 func purgeAllDuplicates(downloadDir string) {
-	fmt.Printf("\n[校验] 正在扫描广告切片并剔除...")
+	fmt.Printf("\n[校验] 正在分析并剔除广告切片...")
 	hashCount := make(map[string]int)
 	hashToFileList := make(map[string][]string)
 
@@ -120,7 +134,8 @@ func purgeAllDuplicates(downloadDir string) {
 		if filepath.Ext(f.Name()) != ".ts" { continue }
 		path := filepath.Join(downloadDir, f.Name())
 		
-		file, _ := os.Open(path)
+		file, err := os.Open(path)
+		if err != nil { continue }
 		h := md5.New()
 		io.Copy(h, file)
 		file.Close()
@@ -130,54 +145,49 @@ func purgeAllDuplicates(downloadDir string) {
 		hashToFileList[sha] = append(hashToFileList[sha], path)
 	}
 
-	delCount := 0
+	delTotal := 0
 	for sha, count := range hashCount {
 		if count > 1 {
-			fmt.Printf("\n[命中广告/重复项] 内容哈希 %s 出现 %d 次，全数清理...", sha[:8], count)
+			fmt.Printf("\n[发现广告/重复] Hash: %s 出现 %d 次，正在执行剔除...", sha[:8], count)
 			for _, p := range hashToFileList[sha] {
 				os.Remove(p)
-				delCount++
+				delTotal++
 			}
 		}
 	}
-	fmt.Printf("\n[完成] 共剔除 %d 个异常切片。\n", delCount)
+	fmt.Printf("\n[清理] 已剔除 %d 个异常文件。\n", delTotal)
 }
 
-// 调用外部 FFmpeg 合并
 func mergeWithFFmpeg(downloadDir, movieName, savePath string) string {
-	fmt.Println("[FFmpeg] 正在生成合并清单并调用外部 FFmpeg...")
-	
-	// 1. 生成 filelist.txt
 	listPath := filepath.Join(downloadDir, "filelist.txt")
 	listFile, _ := os.Create(listPath)
 	
 	files, _ := ioutil.ReadDir(downloadDir)
+	count := 0
 	for _, f := range files {
 		if filepath.Ext(f.Name()) == ".ts" {
-			// FFmpeg concat 格式: file 'path'
 			listFile.WriteString(fmt.Sprintf("file '%s'\n", f.Name()))
+			count++
 		}
 	}
 	listFile.Close()
 
+	if count == 0 { return "" }
+
 	outputMp4 := filepath.Join(savePath, movieName+".mp4")
-	
-	// 2. 外部调用 FFmpeg (增加 -fflags +genpts 以修复删除切片后的时间戳)
+	// 外部调用 ffmpeg 保证删除中间切片后视频依然能流畅播放
 	cmd := exec.Command("ffmpeg", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-fflags", "+genpts", "-y", outputMp4)
 	
 	var errOut bytes.Buffer
 	cmd.Stderr = &errOut
-
-	err := cmd.Run()
-	if err != nil {
-		fmt.Printf("\n[错误] FFmpeg 执行失败: %v\n详情: %s\n", err, errOut.String())
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("\n[FFmpeg Error]: %s\n", errOut.String())
 		return ""
 	}
-
 	return outputMp4
 }
 
-// --- 原有辅助函数 (保持不变，确保兼容 go.mod) ---
+// --- 以下保持原下载逻辑不变 ---
 
 func getHost(Url, ht string) (host string) {
 	u, _ := url.Parse(Url)
@@ -260,6 +270,11 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 		}(ts, i)
 	}
 	wg.Wait()
+}
+
+func checkTsDownDir(dir string) bool {
+	f, _ := ioutil.ReadDir(dir)
+	return len(f) > 0
 }
 
 func DrawProgressBar(prefix string, proportion float32, width int, suffix ...string) {
