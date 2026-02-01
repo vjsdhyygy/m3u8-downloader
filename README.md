@@ -1,98 +1,53 @@
 # m3u8-downloader
 
-golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指定必要的 flag (`u`、`o`、`n`、`ht`) 来运行, 工具就会自动帮你解析 M3U8 文件，并将 TS 片段下载下来合并成一个文件。
+Golang 多线程下载 M3U8 视频工具。只需指定必要的参数，工具即可自动解析、下载、解密并合并视频。
 
+**[2026 增强版特性]**：针对包含周期性广告切片的资源进行了逻辑优化，支持通过 MD5 校验自动剔除广告，并调用 FFmpeg 重新生成时间戳，确保合并后视频播放顺畅。
 
 ## 功能介绍
 
-1. 下载和解析 M3U8
-2. 下载 TS 失败重试 （加密的同步解密)
-3. 自动删除相同的TS切片
-4. 合并 TS 片段 ，不再是内部合并，需要调用ffmpeg，请先安装ffmpeg
+1. **智能解析**：自动解析 M3U8 索引及其嵌套。
+2. **多线程下载**：支持自定义线程数，具备失败自动重试机制。
+3. **同步解密**：支持 AES-128-CBC 加密片段的同步解密。
+4. **暴力去广告**：**[New]** 自动检测并删除 MD5 哈希相同的重复 TS 切片。通过“只要重复全数剔除”逻辑，精准识别并清除视频中间穿插的固定广告。
+5. **FFmpeg 强力合并**：**[New]** 弃用原生二进制追加，改用外部 FFmpeg 调用的 `concat` 模式合并。即便剔除了中间的广告切片，也能自动修复 PTS 时间戳，保证画面不卡顿、音画同步。
 
 > 可以下载岛国小电影  
 > 可以下载岛国小电影  
-> 可以下载岛国小电影    
+> 可以下载岛国小电影  
 > 重要的事情说三遍......
 
 ## 效果展示
 ![demo](./demo.gif)
 
-## 参数说明：
+## 参数说明
 
-```
-- u  m3u8下载地址(http(s)://url/xx/xx/index.m3u8)
-- o  movieName:自定义文件名(默认为movie)不带后缀 (default "movie")
-- n  num:下载线程数(默认24)
-- ht hostType:设置getHost的方式(v1: http(s):// + url.Host + filepath.Dir(url.Path); v2: `http(s)://+ u.Host` (default "v1")
-- c  cookie:自定义请求cookie (例如：key1=v1; key2=v2)
-- r  autoClear:是否自动清除ts文件 (default true)
-- s  InsecureSkipVerify:是否允许不安全的请求(默认0)
-- sp savePath:文件保存的绝对路径(默认为当前路径,建议默认值)(例如：unix:/Users/xxxx ; windows:C:\Documents)
-```
+| 参数 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| **-u** | m3u8下载地址 (http(s)://url/xx/xx/index.m3u8) | 必填 |
+| **-o** | movieName: 自定义文件名（不带后缀） | movie |
+| **-n** | num: 下载线程数 | 24 |
+| **-ht** | hostType: 设置 getHost 方式 (v1: Host+路径; v2: 仅 Host) | v1 |
+| **-c** | cookie: 自定义请求 Cookie (例如: "key1=v1; key2=v2") | 空 |
+| **-r** | autoClear: 合并后是否自动清除 TS 缓存目录，默认保留原始TS切片 | false |
+| **-s** | InsecureSkipVerify: 是否允许不安全请求 (1为开启, 0为关闭) | 0 |
+| **-sp** | savePath: 文件保存的绝对路径 (默认为程序运行路径) | 当前路径 |
 
-默认情况只需要传`u`参数,其他参数保持默认即可。 部分链接可能限制请求频率，可根据实际情况调整 `n` 参数的值。
+## 环境准备
 
-## 下载
-
-原作者已经编译好的平台有： [点击下载](https://github.com/llychao/m3u8-downloader/releases) 
-
-- m3u8-darwin-amd64
-- m3u8-darwin-arm64
-- m3u8-linux-386
-- m3u8-linux-amd64
-- m3u8-linux-arm64
-- m3u8-windows-386.exe
-- m3u8-windows-amd64.exe
-- m3u8-windows-arm64.exe
+本工具需要调用系统 `ffmpeg` 命令进行合并，请确保已安装：
+- **Linux**: `apt install ffmpeg` 或 `yum install ffmpeg`
+- **Mac**: `brew install ffmpeg`
+- **Windows**: 下载 `ffmpeg.exe` 并添加到系统环境变量 PATH 中。
 
 ## 用法
 
-### 源码方式
-
+### 1. 源码方式 (自行编译)
 ```bash
-自己编译：go build -o m3u8-downloader
-简洁使用：./m3u8-downloader  -u=http://example.com/index.m3u8
-完整使用：./m3u8-downloader  -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
-```
+go build -o m3u8-downloader main.go
 
-### 二进制方式:
+# 简洁使用
+./m3u8-downloader -u="[http://example.com/index.m3u8](http://example.com/index.m3u8)"
 
-Linux 和 MacOS 和 Windows PowerShell
-
-```
-简洁使用：
-./m3u8-linux-amd64 -u=http://example.com/index.m3u8
-./m3u8-darwin-amd64 -u=http://example.com/index.m3u8 
-.\m3u8-windows-amd64.exe -u=http://example.com/index.m3u8
-
-完整使用：
-./m3u8-linux-amd64 -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
-./m3u8-darwin-amd64 -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
-.\m3u8-windows-amd64.exe -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
-```
-
-## 问题说明
-
-1.在Linux或者mac平台，如果显示无运行权限，请用chmod 命令进行添加权限
-```bash
- # Linux amd64平台
- chmod 0755 m3u8-linux-amd64
- # Mac darwin amd64平台
- chmod 0755 m3u8-darwin-amd64
- ```
-2.下载失败的情况,请设置 -ht="v1" 或者 -ht="v2" （默认为 v1）
-```golang
-func get_host(Url string, ht string) string {
-    u, err := url.Parse(Url)
-    var host string
-    checkErr(err)
-    switch ht {
-    case "v1":
-        host = u.Scheme + "://" + u.Host + path.Dir(u.Path)
-    case "v2":
-        host = u.Scheme + "://" + u.Host
-    }
-    return host
-}
-```
+# 完整示例
+./m3u8-downloader -u="[http://xxx.com/xxx.m3u8](http://xxx.com/xxx.m3u8)" -o="我的视频" -n=32 -ht=v2
